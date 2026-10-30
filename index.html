@@ -1,0 +1,1025 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1,maximum-scale=1,user-scalable=no"/>
+<title>ALLIGATOR SENYA — DENTIST</title>
+<style>
+  *{margin:0;padding:0;box-sizing:border-box}
+  html,body{width:100%;height:100%;overflow:hidden;background:#050a08;
+    font-family:'Trebuchet MS',system-ui,sans-serif;user-select:none;
+    -webkit-tap-highlight-color:transparent}
+  canvas{display:block;position:fixed;inset:0;cursor:crosshair;touch-action:none}
+  .overlay{position:fixed;inset:0;display:flex;flex-direction:column;align-items:center;
+    justify-content:center;gap:16px;text-align:center;padding:24px;
+    background:rgba(2,8,6,.84);z-index:10;backdrop-filter:blur(3px)}
+  .overlay.hidden{display:none}
+  h1{font-size:clamp(24px,5.6vw,58px);letter-spacing:5px;color:#8fd48f;
+    text-shadow:0 0 24px rgba(80,220,120,.5);font-weight:800}
+  h1.red{color:#ff3b30;text-shadow:0 0 30px rgba(255,0,0,.85);
+    animation:pulse .55s infinite alternate;letter-spacing:3px}
+  @keyframes pulse{from{opacity:.75;transform:scale(.98)}to{opacity:1;transform:scale(1.04)}}
+  h2.halloween{font-size:clamp(18px,3.6vw,32px);letter-spacing:5px;font-weight:900;
+    color:#ff8c1a;
+    text-shadow:0 0 18px rgba(255,130,0,.85),
+                0 0 44px rgba(255,60,0,.55),
+                0 3px 0 #5a1d00;
+    animation:flicker 2.6s infinite ease-in-out}
+  @keyframes flicker{
+    0%,100%{opacity:1;transform:translateY(0)}
+    42%{opacity:.92}
+    47%{opacity:.55;transform:translateY(-1px)}
+    52%{opacity:.98;transform:translateY(1px)}
+    70%{opacity:.80}
+  }
+  p{color:#a9c4b0;font-size:clamp(14px,2.2vw,18px);max-width:580px;line-height:1.55}
+  .warn{color:#ffb020;font-weight:700;font-size:clamp(12px,1.8vw,15px)}
+  .tip{color:#7fd6a0;font-size:clamp(13px,2vw,17px);font-weight:700}
+  button{margin-top:12px;padding:14px 40px;font-size:clamp(16px,2.4vw,20px);font-weight:800;
+    letter-spacing:3px;color:#06210f;background:linear-gradient(#9be89b,#4fbf6a);
+    border:none;border-radius:10px;cursor:pointer;
+    box-shadow:0 6px 0 #1f6a33,0 10px 24px rgba(0,0,0,.6);transition:transform .08s}
+  button:active{transform:translateY(4px);box-shadow:0 2px 0 #1f6a33}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="startScreen" class="overlay">
+  <h1>ALLIGATOR SENYA</h1>
+  <p>Senya has a toothache. She is being very brave about it.</p>
+  <p class="tip">Hold a tooth and drag SLOWLY inward — toward the middle of her mouth.<br>If you yank, she starts to vibrate.</p>
+  <p class="warn">⚠ WARNING: sudden jumpscare and loud audio. She will snap eventually.</p>
+  <button id="startBtn">BEGIN</button>
+</div>
+
+<div id="overScreen" class="overlay hidden">
+  <h1 class="red">SENYA HAS HAD ENOUGH</h1>
+  <h2 class="halloween">🎃 HAPPY HALLOWEEN 🎃</h2>
+  <p id="overText">Teeth extracted: 0</p>
+  <button id="againBtn">TRY AGAIN</button>
+</div>
+
+<script>
+(function(){
+'use strict';
+
+/* ============================ SETUP ============================ */
+const canvas = document.getElementById('c');
+const ctx = canvas.getContext('2d');
+let W = 0, H = 0, DPR = 1;
+
+const G = { cx:0, cy:0, headRx:0, headRy:0, mouthRx:0, mouthRy:0,
+            base:1, teeth:[], reeds:[], scales:[] };
+
+const state = {
+  phase:'start',      // start | play | scare | gameover
+  pulled:0,
+  time:0,
+  shake:0,
+  scareT:0,
+  particles:[],
+  hover:null,
+  heartTimer:0,
+  anger:0,            // 0 calm .. 1 = SNAP
+  tremble:0,          // spike value from yanking
+  grip:null           // { tooth, lastX, lastY, lastT }
+};
+
+/* tuning */
+const REQUIRED_DRAG = 150;   // px * base, projected along the tooth axis (inward)
+const SAFE_SPEED    = 430;   // px/s * base
+const DECAY_RATE    = 1.5;   // progress lost per second when released
+
+/* ============================ AUDIO ============================ */
+let actx = null, master = null;
+
+function initAudio(){
+  if(actx) { if(actx.state === 'suspended') actx.resume(); return; }
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if(!AC) return;
+  actx = new AC();
+  master = actx.createGain();
+  master.gain.value = 0.55;
+  master.connect(actx.destination);
+}
+
+function makeDistCurve(k){
+  const n = 1024, curve = new Float32Array(n);
+  for(let i=0;i<n;i++){
+    const x = i*2/n - 1;
+    curve[i] = (1+k)*x/(1+k*Math.abs(x));
+  }
+  return curve;
+}
+
+function noiseBurst(dur, vol, cutoff){
+  if(!actx) return;
+  const sr = actx.sampleRate;
+  const buf = actx.createBuffer(1, Math.ceil(sr*dur), sr);
+  const d = buf.getChannelData(0);
+  for(let i=0;i<d.length;i++){
+    d[i] = (Math.random()*2-1) * (1 - i/d.length);
+  }
+  const src = actx.createBufferSource(); src.buffer = buf;
+  const f = actx.createBiquadFilter();
+  f.type = 'lowpass'; f.frequency.value = cutoff || 2500;
+  const g = actx.createGain(); g.gain.value = vol;
+  src.connect(f); f.connect(g); g.connect(master);
+  src.start();
+}
+
+function popSound(){
+  if(!actx) return;
+  const t = actx.currentTime;
+  const o = actx.createOscillator();
+  const g = actx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(340, t);
+  o.frequency.exponentialRampToValueAtTime(55, t+0.13);
+  g.gain.setValueAtTime(0.34, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t+0.16);
+  o.connect(g); g.connect(master);
+  o.start(t); o.stop(t+0.2);
+  noiseBurst(0.13, 0.16, 1400);
+}
+
+function growlSound(intensity){
+  if(!actx) return;
+  const t = actx.currentTime;
+  const o = actx.createOscillator();
+  o.type = 'sawtooth';
+  o.frequency.setValueAtTime(70 + intensity*40, t);
+  o.frequency.exponentialRampToValueAtTime(38, t+0.35);
+  const dist = actx.createWaveShaper();
+  dist.curve = makeDistCurve(12);
+  const g = actx.createGain();
+  g.gain.setValueAtTime(0.05 + intensity*0.10, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t+0.4);
+  o.connect(dist); dist.connect(g); g.connect(master);
+  o.start(t); o.stop(t+0.45);
+  noiseBurst(0.3, 0.04 + intensity*0.09, 900);
+}
+
+function heartbeat(){
+  if(!actx) return;
+  const t = actx.currentTime;
+  const o = actx.createOscillator();
+  const g = actx.createGain();
+  o.type = 'sine';
+  o.frequency.setValueAtTime(72, t);
+  o.frequency.exponentialRampToValueAtTime(38, t+0.14);
+  g.gain.setValueAtTime(0.0001, t);
+  g.gain.exponentialRampToValueAtTime(0.20, t+0.02);
+  g.gain.exponentialRampToValueAtTime(0.0001, t+0.26);
+  o.connect(g); g.connect(master);
+  o.start(t); o.stop(t+0.3);
+}
+
+function scareSound(){
+  if(!actx) return;
+  const t = actx.currentTime;
+
+  noiseBurst(1.7, 0.95, 6000);
+
+  const o = actx.createOscillator();
+  o.type = 'sawtooth';
+  o.frequency.setValueAtTime(1500, t);
+  o.frequency.exponentialRampToValueAtTime(85, t+1.15);
+  const dist = actx.createWaveShaper();
+  dist.curve = makeDistCurve(80);
+  const g = actx.createGain();
+  g.gain.setValueAtTime(0.55, t);
+  g.gain.exponentialRampToValueAtTime(0.001, t+1.5);
+  o.connect(dist); dist.connect(g); g.connect(master);
+  o.start(t); o.stop(t+1.6);
+
+  const o2 = actx.createOscillator();
+  const g2 = actx.createGain();
+  o2.type = 'sine';
+  o2.frequency.setValueAtTime(130, t);
+  o2.frequency.exponentialRampToValueAtTime(28, t+0.9);
+  g2.gain.setValueAtTime(0.95, t);
+  g2.gain.exponentialRampToValueAtTime(0.001, t+1.1);
+  o2.connect(g2); g2.connect(master);
+  o2.start(t); o2.stop(t+1.1);
+}
+
+/* ============================ LAYOUT ============================ */
+function layout(){
+  const prev = G.teeth.map(t => ({ pulled:t.pulled, progress:t.progress }));
+
+  const base = Math.max(0.42, Math.min(W/1100, H/800));
+  G.base = base;
+  G.cx = W/2;
+  G.cy = H*0.54;
+  G.headRx = 360*base;
+  G.headRy = 300*base;
+  G.mouthRx = 265*base;
+  G.mouthRy = 150*base;
+
+  G.teeth = [];
+
+  // upper row — pointing down toward centre (inward)
+  for(let i=0;i<7;i++){
+    const u = -0.86 + 1.72*i/6;
+    const sy = Math.sqrt(Math.max(0, 1-u*u));
+    const bx = G.cx + u*G.mouthRx;
+    const by = G.cy - G.mouthRy*sy;
+    let nx = -u/G.mouthRx, ny = sy/G.mouthRy;
+    const nl = Math.hypot(nx,ny); nx/=nl; ny/=nl;
+    const k = 0.60 + 0.40*(1-Math.abs(u));
+    G.teeth.push({ bx, by, dx:nx, dy:ny,
+                   w:15*base*k, L:64*base*k,
+                   pulled:false, progress:0 });
+  }
+
+  // lower row — pointing up toward centre (inward)
+  for(let i=0;i<6;i++){
+    const u = -0.74 + 1.48*i/5;
+    const sy = Math.sqrt(Math.max(0, 1-u*u));
+    const bx = G.cx + u*G.mouthRx;
+    const by = G.cy + G.mouthRy*sy;
+    let nx = -u/G.mouthRx, ny = -sy/G.mouthRy;
+    const nl = Math.hypot(nx,ny); nx/=nl; ny/=nl;
+    const k = 0.58 + 0.42*(1-Math.abs(u));
+    G.teeth.push({ bx, by, dx:nx, dy:ny,
+                   w:14*base*k, L:58*base*k,
+                   pulled:false, progress:0 });
+  }
+
+  G.teeth.forEach((t,i)=>{
+    if(prev[i]){ t.pulled = prev[i].pulled; t.progress = prev[i].progress; }
+  });
+
+  G.reeds = [];
+  for(let i=0;i<46;i++){
+    G.reeds.push({
+      x: Math.random()*W,
+      h: 70 + Math.random()*300,
+      w: 1.5 + Math.random()*3,
+      a: 0.08 + Math.random()*0.22,
+      s: Math.random()*6.283,
+      sp: 0.4 + Math.random()*0.9
+    });
+  }
+
+  G.scales = [];
+  for(let i=0;i<80;i++){
+    const a = Math.random()*Math.PI*2;
+    const r = Math.sqrt(Math.random());
+    G.scales.push({
+      x: Math.cos(a)*r*0.93,
+      y: Math.sin(a)*r*0.88,
+      s: 7 + Math.random()*16,
+      rot: Math.random()*3.14
+    });
+  }
+}
+
+/* ============================ HELPERS ============================ */
+/* tooth slides INWARD (along its own axis) as it is worked loose */
+function toothBase(t){
+  const off = t.L*0.55*t.progress;
+  return { bx: t.bx + t.dx*off, by: t.by + t.dy*off };
+}
+
+function triPath(bx,by,dx,dy,w,L){
+  const px = -dy, py = dx;
+  ctx.beginPath();
+  ctx.moveTo(bx + px*w, by + py*w);
+  ctx.lineTo(bx - px*w, by - py*w);
+  ctx.lineTo(bx + dx*L, by + dy*L);
+  ctx.closePath();
+}
+
+function triFill(bx,by,dx,dy,w,L,color){
+  triPath(bx,by,dx,dy,w,L);
+  ctx.fillStyle = color;
+  ctx.fill();
+}
+
+function pointInTri(px,py,a,b,c){
+  const s = (x1,y1,x2,y2,x3,y3)=> (x1-x3)*(y2-y3)-(x2-x3)*(y1-y3);
+  const d1 = s(px,py,a.x,a.y,b.x,b.y);
+  const d2 = s(px,py,b.x,b.y,c.x,c.y);
+  const d3 = s(px,py,c.x,c.y,a.x,a.y);
+  const neg = (d1<0)||(d2<0)||(d3<0);
+  const pos = (d1>0)||(d2>0)||(d3>0);
+  return !(neg && pos);
+}
+
+function hitTooth(t, x, y){
+  const b = toothBase(t);
+  const px = -t.dy, py = t.dx;
+  const A = { x: b.bx + px*t.w, y: b.by + py*t.w };
+  const B = { x: b.bx - px*t.w, y: b.by - py*t.w };
+  const C = { x: b.bx + t.dx*t.L, y: b.by + t.dy*t.L };
+  const cx = (A.x+B.x+C.x)/3, cy = (A.y+B.y+C.y)/3;
+  const k = 1.55;
+  const ex = p => ({ x: cx + (p.x-cx)*k, y: cy + (p.y-cy)*k });
+  return pointInTri(x, y, ex(A), ex(B), ex(C));
+}
+
+/* ============================ GAME LOGIC ============================ */
+function spawnBlood(x, y, tooth){
+  for(let i=0;i<15;i++){
+    const a = Math.random()*Math.PI*2;
+    const sp = 60 + Math.random()*330;
+    state.particles.push({
+      type:'blood', x, y,
+      vx: Math.cos(a)*sp + tooth.dx*130,
+      vy: Math.sin(a)*sp + tooth.dy*130 - 130,
+      r: 2 + Math.random()*4.5,
+      g: 1450,
+      life: 0.6 + Math.random()*0.7
+    });
+  }
+}
+
+function pullTooth(tooth){
+  if(tooth.pulled) return;
+  tooth.pulled = true;
+  tooth.progress = 0;
+  state.pulled++;
+  state.shake = 16;
+  state.anger = Math.min(1, state.anger + 0.045);
+  popSound();
+  growlSound(0.35);
+
+  const b = toothBase(tooth);
+  spawnBlood(b.bx + tooth.dx*tooth.L*0.45,
+             b.by + tooth.dy*tooth.L*0.45, tooth);
+
+  state.particles.push({
+    type:'tooth',
+    x: b.bx, y: b.by,
+    dx: tooth.dx, dy: tooth.dy,
+    w: tooth.w, L: tooth.L,
+    vx: tooth.dx*430 + (Math.random()-0.5)*280,
+    vy: tooth.dy*430 - 430,
+    rot: 0, vr: (Math.random()-0.5)*18,
+    g: 1500, life: 2.2
+  });
+
+  if(state.pulled >= G.teeth.length) triggerScare();
+}
+
+function triggerScare(){
+  state.phase = 'scare';
+  state.scareT = 0;
+  state.shake = 32;
+  state.hover = null;
+  state.grip = null;
+  scareSound();
+}
+
+function reset(){
+  state.pulled = 0;
+  state.particles = [];
+  state.shake = 0;
+  state.scareT = 0;
+  state.hover = null;
+  state.heartTimer = 0;
+  state.anger = 0;
+  state.tremble = 0;
+  state.grip = null;
+  for(const t of G.teeth){ t.pulled = false; t.progress = 0; }
+}
+
+/* ============================ UPDATE ============================ */
+function update(dt){
+  state.time += dt;
+
+  if(state.shake > 0){
+    state.shake *= Math.pow(0.0008, dt);
+    if(state.shake < 0.25) state.shake = 0;
+  }
+
+  // tremble spikes fade
+  state.tremble *= Math.pow(0.02, dt);
+  if(state.tremble < 0.005) state.tremble = 0;
+
+  // particles
+  for(let i=state.particles.length-1;i>=0;i--){
+    const p = state.particles[i];
+    p.life -= dt;
+    if(p.life <= 0){ state.particles.splice(i,1); continue; }
+    p.vy += (p.g || 900)*dt;
+    p.x += p.vx*dt;
+    p.y += p.vy*dt;
+    if(p.rot !== undefined) p.rot += p.vr*dt;
+  }
+
+  if(state.phase === 'play'){
+    // teeth that aren't being held slip back in
+    for(const t of G.teeth){
+      if(t.pulled) continue;
+      if(state.grip && state.grip.tooth === t) continue;
+      if(t.progress > 0){
+        t.progress = Math.max(0, t.progress - DECAY_RATE*dt);
+      }
+    }
+
+    // Senya's patience drains no matter how careful you are
+    const passive = 0.012 + 0.0045*state.pulled;
+    state.anger = Math.min(1, state.anger + passive*dt);
+
+    // heartbeat quickens as she gets angrier
+    const rate = Math.max(0.28, 1.05 - state.anger*0.72 - state.pulled*0.03);
+    state.heartTimer -= dt;
+    if(state.heartTimer <= 0){
+      state.heartTimer = rate;
+      heartbeat();
+    }
+
+    if(state.anger >= 1) triggerScare();
+  }
+
+  if(state.phase === 'scare'){
+    state.scareT += dt;
+    if(state.scareT > 1.65){
+      state.phase = 'gameover';
+      document.getElementById('overText').textContent =
+        'Teeth extracted: ' + state.pulled;
+      document.getElementById('overScreen').classList.remove('hidden');
+    }
+  }
+}
+
+/* ============================ DRAWING ============================ */
+function drawBackground(){
+  const bg = ctx.createLinearGradient(0,0,0,H);
+  bg.addColorStop(0, '#0a1712');
+  bg.addColorStop(0.6, '#061009');
+  bg.addColorStop(1, '#030604');
+  ctx.fillStyle = bg;
+  ctx.fillRect(0,0,W,H);
+
+  const mg = ctx.createRadialGradient(W/2, H*0.45, 20, W/2, H*0.45, Math.max(W,H)*0.7);
+  mg.addColorStop(0, 'rgba(30,70,45,0.20)');
+  mg.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = mg;
+  ctx.fillRect(0,0,W,H);
+
+  ctx.strokeStyle = '#0c2216';
+  ctx.lineCap = 'round';
+  for(const r of G.reeds){
+    const sway = Math.sin(state.time*r.sp + r.s)*12;
+    ctx.globalAlpha = r.a + 0.15;
+    ctx.lineWidth = r.w;
+    ctx.beginPath();
+    ctx.moveTo(r.x, H + 10);
+    ctx.quadraticCurveTo(r.x + sway*0.5, H - r.h*0.5, r.x + sway, H - r.h);
+    ctx.stroke();
+  }
+  ctx.globalAlpha = 1;
+}
+
+function drawToothShape(bx,by,dx,dy,w,L,hl){
+  if(hl){
+    ctx.save();
+    ctx.shadowColor = '#fffce0';
+    ctx.shadowBlur = 22;
+    triPath(bx,by,dx,dy,w,L);
+    ctx.fillStyle = '#fffdf0';
+    ctx.fill();
+    ctx.restore();
+  } else {
+    const g = ctx.createLinearGradient(bx, by, bx + dx*L, by + dy*L);
+    g.addColorStop(0, '#cfc6a8');
+    g.addColorStop(0.55, '#f0ead4');
+    g.addColorStop(1, '#ffffff');
+    triPath(bx,by,dx,dy,w,L);
+    ctx.fillStyle = g;
+    ctx.fill();
+  }
+  ctx.strokeStyle = 'rgba(60,50,35,0.55)';
+  ctx.lineWidth = 1.4;
+  ctx.stroke();
+}
+
+function drawGator(t){
+  const {cx, cy, headRx, headRy, mouthRx, mouthRy, base} = G;
+  const bob = Math.sin(t*1.6)*3*base;
+
+  // --- vibration ---
+  const amp = (state.anger*state.anger*14 + state.tremble*16) * base;
+  const tx = (Math.random()-0.5)*amp;
+  const ty = (Math.random()-0.5)*amp;
+
+  ctx.save();
+  ctx.translate(tx, ty + bob);
+
+  // aura
+  const glow = ctx.createRadialGradient(cx, cy, headRy*0.2, cx, cy, headRx*1.7);
+  const angerGlow = state.anger;
+  glow.addColorStop(0, 'rgba(' + Math.round(60+150*angerGlow) + ',' +
+                        Math.round(130-70*angerGlow) + ',65,0.25)');
+  glow.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = glow;
+  ctx.fillRect(-W, -H, W*3, H*3);
+
+  // head
+  ctx.save();
+  ctx.shadowColor = 'rgba(0,0,0,0.9)';
+  ctx.shadowBlur = 70*base;
+  ctx.shadowOffsetY = 28*base;
+  const hg = ctx.createRadialGradient(
+    cx - headRx*0.35, cy - headRy*0.45, headRy*0.05,
+    cx, cy, headRx*1.15);
+  hg.addColorStop(0, '#5f9445');
+  hg.addColorStop(0.5, '#38612d');
+  hg.addColorStop(1, '#142a12');
+  ctx.fillStyle = hg;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, headRx, headRy, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+
+  // hide scales
+  ctx.fillStyle = 'rgba(10,30,10,0.35)';
+  for(const s of G.scales){
+    ctx.beginPath();
+    ctx.ellipse(cx + s.x*headRx, cy + s.y*headRy,
+                s.s*base, s.s*base*0.6, s.rot, 0, Math.PI*2);
+    ctx.fill();
+  }
+
+  // ---- mouth ----
+  const mg = ctx.createRadialGradient(cx, cy, mouthRy*0.15, cx, cy, mouthRx);
+  mg.addColorStop(0, '#3c0a0a');
+  mg.addColorStop(0.7, '#1a0303');
+  mg.addColorStop(1, '#080101');
+  ctx.fillStyle = mg;
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, mouthRx, mouthRy, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  // tongue
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(cx, cy, mouthRx, mouthRy, 0, 0, Math.PI*2);
+  ctx.clip();
+  ctx.fillStyle = '#7d2430';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + mouthRy*0.62, mouthRx*0.72, mouthRy*0.55, 0,0,Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle = 'rgba(200,80,100,0.25)';
+  ctx.beginPath();
+  ctx.ellipse(cx, cy + mouthRy*0.5, mouthRx*0.45, mouthRy*0.25, 0,0,Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+
+  // ---- teeth ----
+  for(const tooth of G.teeth){
+    if(tooth.pulled){
+      ctx.fillStyle = '#4d0e14';
+      ctx.beginPath();
+      ctx.ellipse(tooth.bx, tooth.by, 10*base, 7*base, 0, 0, Math.PI*2);
+      ctx.fill();
+      continue;
+    }
+    const b = toothBase(tooth);
+    drawToothShape(b.bx, b.by, tooth.dx, tooth.dy,
+                   tooth.w, tooth.L, state.hover === tooth);
+
+    // extraction progress ring
+    if(tooth.progress > 0.02){
+      const p = tooth.progress;
+      ctx.save();
+      ctx.lineWidth = 4*base;
+      ctx.strokeStyle = 'rgba(255,' + Math.round(210 - 130*p) + ',70,0.95)';
+      ctx.beginPath();
+      ctx.arc(b.bx, b.by, 20*base, -Math.PI/2, -Math.PI/2 + Math.PI*2*p);
+      ctx.stroke();
+      ctx.restore();
+    }
+
+    // grip highlight
+    if(state.grip && state.grip.tooth === tooth){
+      ctx.save();
+      ctx.strokeStyle = 'rgba(255,255,220,0.85)';
+      ctx.lineWidth = 2.5*base;
+      ctx.beginPath();
+      ctx.arc(b.bx, b.by, 27*base, 0, Math.PI*2);
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+
+  // ---- eyes ----
+  const eyeX = headRx*0.46, eyeY = -headRy*0.72;
+  const bt = (t*1.25 + 0.7) % 4.2;
+  let blink = 1;
+  if(bt < 0.14) blink = 0.08 + Math.abs(bt-0.07)/0.07*0.9;
+
+  const pupil = Math.max(0.30, 1 - state.pulled*0.06 - state.anger*0.45);
+
+  for(const s of [-1,1]){
+    const x = cx + s*eyeX, y = cy + eyeY;
+
+    // anger halo
+    if(state.anger > 0.35){
+      const ag = ctx.createRadialGradient(x, y, 4, x, y, 110*base);
+      ag.addColorStop(0, 'rgba(255,60,30,' + (0.35*state.anger).toFixed(3) + ')');
+      ag.addColorStop(1, 'rgba(255,0,0,0)');
+      ctx.fillStyle = ag;
+      ctx.beginPath(); ctx.arc(x, y, 110*base, 0, Math.PI*2); ctx.fill();
+    }
+
+    // eyelid mound
+    const eg = ctx.createRadialGradient(x - s*10*base, y-14*base, 4, x, y, 58*base);
+    eg.addColorStop(0, '#548a3d');
+    eg.addColorStop(1, '#22421c');
+    ctx.fillStyle = eg;
+    ctx.beginPath(); ctx.arc(x, y, 56*base, 0, Math.PI*2); ctx.fill();
+
+    // eyeball
+    ctx.fillStyle = '#e6c93a';
+    ctx.beginPath();
+    ctx.ellipse(x, y, 34*base, 34*base*blink, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // slit pupil
+    ctx.fillStyle = '#0a0a0a';
+    ctx.beginPath();
+    ctx.ellipse(x, y, 8*base*pupil, 26*base*blink*pupil, 0, 0, Math.PI*2);
+    ctx.fill();
+
+    // glint
+    if(blink > 0.5){
+      ctx.fillStyle = 'rgba(255,255,255,0.75)';
+      ctx.beginPath();
+      ctx.arc(x - 11*base, y - 11*base, 5*base, 0, Math.PI*2);
+      ctx.fill();
+    }
+  }
+
+  ctx.restore();
+}
+
+function drawParticles(){
+  for(const p of state.particles){
+    if(p.type === 'blood'){
+      ctx.globalAlpha = Math.min(1, p.life*1.8);
+      ctx.fillStyle = '#b0121f';
+      ctx.beginPath();
+      ctx.arc(p.x, p.y, p.r, 0, Math.PI*2);
+      ctx.fill();
+      ctx.globalAlpha = 1;
+    } else if(p.type === 'tooth'){
+      ctx.save();
+      ctx.translate(p.x, p.y);
+      ctx.rotate(p.rot);
+      const px = -p.dy, py = p.dx;
+      ctx.beginPath();
+      ctx.moveTo(px*p.w, py*p.w);
+      ctx.lineTo(-px*p.w, -py*p.w);
+      ctx.lineTo(p.dx*p.L, p.dy*p.L);
+      ctx.closePath();
+      ctx.fillStyle = '#efe8d2';
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(90,80,60,0.7)';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+      ctx.restore();
+    }
+  }
+}
+
+function drawHUD(){
+  if(state.phase !== 'play') return;
+  const fs = Math.round(18*Math.max(0.85, G.base));
+  const base = G.base;
+
+  ctx.save();
+  ctx.font = 'bold ' + fs + 'px Trebuchet MS, sans-serif';
+  ctx.textBaseline = 'top';
+  ctx.textAlign = 'left';
+  ctx.fillStyle = 'rgba(160,225,170,0.85)';
+  ctx.fillText('TEETH EXTRACTED: ' + state.pulled, 26, 24);
+
+  ctx.textAlign = 'right';
+  ctx.fillStyle = 'rgba(160,225,170,0.40)';
+  ctx.fillText('PATIENT: SENYA', W-26, 24);
+
+  // ---- patience bar ----
+  const bw = Math.min(340, W*0.55);
+  const bh = 16*Math.max(0.8, base);
+  const bx = (W - bw)/2;
+  const by = H - bh - 34;
+  const calm = Math.max(0, 1 - state.anger);
+
+  ctx.textAlign = 'center';
+  ctx.font = 'bold ' + Math.round(fs*0.85) + 'px Trebuchet MS, sans-serif';
+  ctx.fillStyle = state.anger > 0.7 ? '#ff5a4a' : 'rgba(170,220,180,0.8)';
+  ctx.fillText(state.anger > 0.7 ? 'SENYA IS SHAKING' : "SENYA'S PATIENCE",
+               W/2, by - fs*1.15);
+
+  // track
+  ctx.fillStyle = 'rgba(0,0,0,0.6)';
+  ctx.beginPath();
+  ctx.roundRect(bx, by, bw, bh, bh/2);
+  ctx.fill();
+
+  // fill
+  const grad = ctx.createLinearGradient(bx, 0, bx+bw, 0);
+  grad.addColorStop(0, '#4bd07a');
+  grad.addColorStop(0.55, '#e0c33a');
+  grad.addColorStop(1, '#e0311f');
+  ctx.save();
+  ctx.beginPath();
+  ctx.roundRect(bx, by, bw, bh, bh/2);
+  ctx.clip();
+  ctx.fillStyle = grad;
+  ctx.fillRect(bx + bw*(1-calm), by, bw*calm, bh);
+  ctx.restore();
+
+  ctx.strokeStyle = 'rgba(255,255,255,0.16)';
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.roundRect(bx, by, bw, bh, bh/2);
+  ctx.stroke();
+
+  // running-out pulse
+  if(state.anger > 0.75){
+    ctx.globalAlpha = 0.25 + 0.25*Math.sin(state.time*16);
+    ctx.fillStyle = '#ff2a1a';
+    ctx.beginPath();
+    ctx.roundRect(bx, by, bw, bh, bh/2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+  }
+
+  ctx.restore();
+}
+
+/* ============================ JUMPSCARE ============================ */
+function drawScare(t){
+  ctx.save();
+
+  ctx.fillStyle = '#0a0000';
+  ctx.fillRect(-300, -300, W+600, H+600);
+
+  if(t < 0.10){
+    ctx.fillStyle = 'rgba(255,255,255,' + (1 - t/0.10).toFixed(3) + ')';
+    ctx.fillRect(-300, -300, W+600, H+600);
+  }
+
+  const jx = (Math.random()-0.5)*46;
+  const jy = (Math.random()-0.5)*46;
+  const s = Math.min(W,H)/470 * (1 + Math.min(t,0.55)*1.35);
+
+  ctx.save();
+  ctx.translate(W/2 + jx, H/2 + jy);
+  ctx.scale(s, s);
+  ctx.translate(-250, -250);
+
+  const hg = ctx.createRadialGradient(205, 155, 30, 250, 260, 330);
+  hg.addColorStop(0, '#4f7d36');
+  hg.addColorStop(0.6, '#1e3d18');
+  hg.addColorStop(1, '#07120a');
+  ctx.fillStyle = hg;
+  ctx.beginPath();
+  ctx.ellipse(250, 250, 295, 290, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  ctx.fillStyle = '#120000';
+  ctx.beginPath();
+  ctx.ellipse(250, 352, 218, 162, 0, 0, Math.PI*2);
+  ctx.fill();
+
+  ctx.save();
+  ctx.beginPath();
+  ctx.ellipse(250, 352, 218, 162, 0, 0, Math.PI*2);
+  ctx.clip();
+  ctx.fillStyle = '#7c1622';
+  ctx.beginPath();
+  ctx.ellipse(250, 440, 165, 95, 0, 0, Math.PI*2);
+  ctx.fill();
+  ctx.restore();
+
+  for(let i=0;i<12;i++){
+    const u = -0.90 + 1.80*i/11;
+    const sy = Math.sqrt(Math.max(0, 1-u*u));
+    const bx = 250 + u*206;
+    const by = 352 - 152*sy;
+    let dx = u*0.7, dy = 1;
+    const l = Math.hypot(dx,dy); dx/=l; dy/=l;
+    triFill(bx,by,dx,dy,14,64,'#efe9d5');
+  }
+  for(let i=0;i<11;i++){
+    const u = -0.84 + 1.68*i/10;
+    const sy = Math.sqrt(Math.max(0, 1-u*u));
+    const bx = 250 + u*206;
+    const by = 352 + 152*sy;
+    let dx = u*0.7, dy = -1;
+    const l = Math.hypot(dx,dy); dx/=l; dy/=l;
+    triFill(bx,by,dx,dy,14,56,'#efe9d5');
+  }
+
+  for(const sg of [-1,1]){
+    const x = 250 + sg*118, y = 128;
+    const g2 = ctx.createRadialGradient(x,y,3,x,y,100);
+    g2.addColorStop(0, '#ffffff');
+    g2.addColorStop(0.10, '#ff4522');
+    g2.addColorStop(0.45, 'rgba(220,0,0,0.65)');
+    g2.addColorStop(1, 'rgba(150,0,0,0)');
+    ctx.fillStyle = g2;
+    ctx.beginPath(); ctx.arc(x, y, 100, 0, Math.PI*2); ctx.fill();
+    ctx.fillStyle = '#000';
+    ctx.beginPath(); ctx.ellipse(x, y, 9, 44, 0, 0, Math.PI*2); ctx.fill();
+  }
+
+  ctx.restore();
+
+  const vg = ctx.createRadialGradient(
+    W/2, H/2, Math.min(W,H)*0.12,
+    W/2, H/2, Math.max(W,H)*0.78);
+  vg.addColorStop(0, 'rgba(140,0,0,0)');
+  vg.addColorStop(1, 'rgba(95,0,0,0.88)');
+  ctx.fillStyle = vg;
+  ctx.fillRect(-300, -300, W+600, H+600);
+
+  for(let i=0;i<7;i++){
+    if(Math.random() < 0.5) continue;
+    const y = Math.random()*H;
+    ctx.fillStyle = Math.random() < 0.5
+      ? 'rgba(255,20,20,0.18)'
+      : 'rgba(255,255,255,0.09)';
+    ctx.fillRect(0, y, W, 4 + Math.random()*42);
+  }
+
+  ctx.restore();
+}
+
+/* ============================ RENDER ============================ */
+function render(){
+  ctx.clearRect(0, 0, W, H);
+
+  ctx.save();
+  if(state.shake > 0.25){
+    ctx.translate((Math.random()-0.5)*state.shake,
+                  (Math.random()-0.5)*state.shake);
+  }
+
+  if(state.phase === 'scare'){
+    drawScare(state.scareT);
+  } else {
+    drawBackground();
+    drawGator(state.time);
+    drawParticles();
+  }
+
+  ctx.restore();
+
+  drawHUD();
+}
+
+/* ============================ LOOP ============================ */
+let lastT = performance.now();
+function loop(now){
+  const dt = Math.min((now - lastT)/1000, 0.05);
+  lastT = now;
+  update(dt);
+  render();
+  requestAnimationFrame(loop);
+}
+
+/* ============================ INPUT ============================ */
+function getPos(e){
+  const r = canvas.getBoundingClientRect();
+  return { x: e.clientX - r.left, y: e.clientY - r.top };
+}
+
+function findToothAt(x, y){
+  for(const tooth of G.teeth){
+    if(tooth.pulled) continue;
+    if(hitTooth(tooth, x, y)) return tooth;
+  }
+  return null;
+}
+
+canvas.addEventListener('pointerdown', e => {
+  if(state.phase !== 'play') return;
+  e.preventDefault();
+  initAudio();
+  const p = getPos(e);
+  const tooth = findToothAt(p.x, p.y);
+  if(tooth){
+    state.grip = { tooth, lastX:p.x, lastY:p.y, lastT:performance.now() };
+  }
+});
+
+window.addEventListener('pointermove', e => {
+  if(state.phase !== 'play'){ state.hover = null; return; }
+  const p = getPos(e);
+
+  // hover highlight
+  state.hover = findToothAt(p.x, p.y);
+  canvas.style.cursor = state.hover ? 'grab' : 'crosshair';
+
+  const g = state.grip;
+  if(!g) return;
+
+  const now = performance.now();
+  let dt = (now - g.lastT)/1000;
+  dt = Math.max(0.008, Math.min(dt, 0.1));
+
+  const dx = p.x - g.lastX;
+  const dy = p.y - g.lastY;
+  g.lastX = p.x; g.lastY = p.y; g.lastT = now;
+
+  const t = g.tooth;
+  if(t.pulled){ state.grip = null; return; }
+
+  const dist = Math.hypot(dx, dy);
+  const speed = dist/dt;
+  const safe = SAFE_SPEED * G.base;
+
+  // only motion ALONG the tooth (inward, toward the mouth centre) counts
+  const inward = (dx*t.dx + dy*t.dy);
+  if(inward > 0){
+    t.progress = Math.min(1, t.progress + inward/(REQUIRED_DRAG*G.base));
+  }
+
+  // yanking makes her vibrate and lose patience fast
+  if(speed > safe){
+    const over = (speed - safe)/safe;
+    state.anger = Math.min(1, state.anger + Math.min(0.18, over*0.9*dt));
+    state.tremble = Math.min(1.4, state.tremble + over*0.5*dt*8);
+    state.shake = Math.max(state.shake, Math.min(9, over*3));
+    if(Math.random() < 0.10) growlSound(Math.min(1, state.anger));
+  }
+
+  if(t.progress >= 1){
+    state.grip = null;
+    pullTooth(t);
+  }
+});
+
+function releaseGrip(){
+  if(state.grip){
+    state.grip = null;
+    canvas.style.cursor = 'crosshair';
+  }
+}
+window.addEventListener('pointerup', releaseGrip);
+window.addEventListener('pointercancel', releaseGrip);
+window.addEventListener('blur', releaseGrip);
+
+document.getElementById('startBtn').addEventListener('click', () => {
+  initAudio();
+  reset();
+  state.phase = 'play';
+  document.getElementById('startScreen').classList.add('hidden');
+});
+
+document.getElementById('againBtn').addEventListener('click', () => {
+  initAudio();
+  reset();
+  state.phase = 'play';
+  document.getElementById('overScreen').classList.add('hidden');
+});
+
+/* ============================ BOOT ============================ */
+function resize(){
+  DPR = Math.min(window.devicePixelRatio || 1, 2);
+  W = window.innerWidth;
+  H = window.innerHeight;
+  canvas.width  = Math.floor(W*DPR);
+  canvas.height = Math.floor(H*DPR);
+  canvas.style.width  = W + 'px';
+  canvas.style.height = H + 'px';
+  ctx.setTransform(DPR, 0, 0, DPR, 0, 0);
+  layout();
+}
+
+// roundRect polyfill for older browsers
+if(!CanvasRenderingContext2D.prototype.roundRect){
+  CanvasRenderingContext2D.prototype.roundRect = function(x,y,w,h,r){
+    if(typeof r === 'number') r = [r,r,r,r];
+    this.moveTo(x+r[0], y);
+    this.lineTo(x+w-r[1], y);
+    this.quadraticCurveTo(x+w, y, x+w, y+r[1]);
+    this.lineTo(x+w, y+h-r[2]);
+    this.quadraticCurveTo(x+w, y+h, x+w-r[2], y+h);
+    this.lineTo(x+r[3], y+h);
+    this.quadraticCurveTo(x, y+h, x, y+h-r[3]);
+    this.lineTo(x, y+r[0]);
+    this.quadraticCurveTo(x, y, x+r[0], y);
+    return this;
+  };
+}
+
+window.addEventListener('resize', resize);
+window.addEventListener('orientationchange', () => setTimeout(resize, 200));
+
+resize();
+requestAnimationFrame(loop);
+
+})();
+</script>
+</body>
+</html>
